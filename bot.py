@@ -27,9 +27,10 @@ http_session = requests.Session()
 # --- УМНОЕ ПОЛУЧЕНИЕ БЕСПЛАТНЫХ МОДЕЛЕЙ ---
 PREFERRED_MODELS = [
     "nvidia/nemotron-3-ultra-550b-a55b:free",
-    "nvidia/nemotron-3-super-120b-a12b:free",
+    "nvidia/nemotron-3.5-lightning:free",
     "google/gemma-4-31b-it:free",
     "google/gemma-4-26b-a4b-it:free",
+    "openrouter/free",
 ]
 
 def get_actual_free_models():
