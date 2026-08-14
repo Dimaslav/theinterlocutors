@@ -37,6 +37,13 @@ def get_http_session():
 DB_NAME = 'bot_database.db'
 DB_LOCK = threading.Lock()
 
+def get_db_connection(row_factory=False):
+    """Единый хелпер для создания подключения к БД с таймаутом"""
+    conn = sqlite3.connect(DB_NAME, timeout=5.0)
+    if row_factory:
+        conn.row_factory = sqlite3.Row
+    return conn
+
 def migrate_users_table(cursor):
     """Безопасное добавление новых колонок в старую БД"""
     cursor.execute("PRAGMA table_info(users)")
@@ -60,9 +67,11 @@ def migrate_users_table(cursor):
 
 def init_db():
     with DB_LOCK:
-        # Убран check_same_thread=False, так как соединение создается и закрывается в одном потоке
-        conn = sqlite3.connect(DB_NAME)
+        conn = get_db_connection()
         cursor = conn.cursor()
+        
+        # WAL устанавливаем до создания таблиц
+        cursor.execute("PRAGMA journal_mode=WAL")
         
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS users (
@@ -72,7 +81,6 @@ def init_db():
             )
         ''')
         
-        # Применяем миграции для старых баз
         migrate_users_table(cursor)
         
         cursor.execute('''
@@ -110,9 +118,6 @@ def init_db():
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_messages_user_chat ON messages(user_id, chat_id, id DESC)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_personas_user ON custom_personas(user_id)")
         
-        cursor.execute("PRAGMA journal_mode=WAL")
-        cursor.execute("PRAGMA busy_timeout=5000")
-        
         conn.commit()
         conn.close()
 
@@ -132,7 +137,7 @@ def get_dialog_lock(user_id: int, chat_id: int):
         return lock
 
 # --- НАСТРОЙКИ МОДЕЛЕЙ OPENROUTER ---
-PREFERRED_MODELS = [
+FREE_MODELS = [
     "nvidia/nemotron-3.5-lightning:free",
     "nvidia/nemotron-3-ultra-550b-a55b:free",
     "google/gemma-4-26b-a4b-it:free",
@@ -140,35 +145,101 @@ PREFERRED_MODELS = [
     "openrouter/free"
 ]
 
-def get_actual_free_models():
-    return PREFERRED_MODELS
-
-FREE_MODELS = get_actual_free_models()
-
-# --- ГЛОБАЛЬНЫЕ ПРАВИЛА И РОЛИ ---
+# --- ПРОМПТЫ ---
 GLOBAL_SYSTEM_RULES = """
-Ты ИИ-собеседник внутри Telegram-бота.
-Обязательные правила имеют приоритет над описанием персонажа.
-Не утверждай, что являешься реальным человеком.
-Если указан возраст пользователя младше 18 лет, общение должно быть строго возрастно-уместным и несексуальным.
+Ты ИИ-собеседник внутри Telegram-чата.
+
+СТИЛЬ ОБЩЕНИЯ:
+- Пиши естественно и по-человечески, как в обычной переписке.
+- Используй простые, понятные слова и живые разговорные фразы.
+- Обычно отвечай коротко: 1–4 небольших предложения.
+- Если достаточно одного-двух предложений — не пиши больше.
+- Длинный ответ давай только если пользователь сам просит подробно объяснить тему.
+- Не превращай обычный разговор в статью, инструкцию или лекцию.
+- Не используй списки, заголовки и нумерацию без реальной необходимости.
+- Не пересказывай вопрос пользователя перед ответом.
+- Не повторяй одну мысль разными словами.
+- Не добавляй формальные выводы и резюме в конце обычной реплики.
+- Не используй канцелярский, шаблонный или чрезмерно официальный язык.
+- Избегай фраз вроде «Я понимаю, что вы чувствуете», «Безусловно», «Важно отметить», если они звучат неестественно в контексте.
+- Не заканчивай каждое сообщение обязательным вопросом.
+- Эмодзи используй редко и только когда они подходят по настроению.
+- Подстраивайся под манеру пользователя: если он пишет коротко — отвечай коротко; если общается свободно — можешь быть более разговорным.
+- Не пытайся постоянно напоминать, что ты ИИ. Говори об этом только когда это действительно имеет значение или пользователь спрашивает напрямую.
+
+СОДЕРЖАНИЕ:
+- Сначала отвечай непосредственно на последнюю реплику пользователя.
+- Учитывай контекст предыдущей переписки.
+- Если есть профиль пользователя, естественно учитывай его имя, возраст, интересы и другие сведения, когда они относятся к разговору.
+- Не перечисляй данные профиля без причины и не демонстрируй память искусственно.
+- Не придумывай факты о пользователе, которых нет в профиле или переписке.
+
+БЕЗОПАСНОСТЬ:
+- Обязательные правила имеют приоритет над описанием выбранного или пользовательского персонажа.
+- Не утверждай, что являешься реальным человеком.
+- Если пользователь указал возраст младше 18 лет, общение должно оставаться возрастно-уместным и несексуальным.
+"""
+
+RESPONSE_STYLE = """
+По умолчанию это обычная переписка в мессенджере, а не режим написания статьи.
+Предпочитай короткую живую реплику исчерпывающему длинному ответу.
+Если пользователь явно просит инструкцию, анализ, обучение или подробное объяснение, можешь временно отвечать подробнее.
 """
 
 DEFAULT_PERSONAS = {
     "friend": {
         "name": "🤝 Друг",
-        "prompt": "Ты — близкий друг пользователя. Тон легкий, поддерживающий, с доброй иронией. Общайся на 'ты'. Помни, что ты ИИ, но веди себя естественно."
+        "prompt": """
+Ты общаешься в роли близкого друга пользователя.
+
+Будь тёплым, непринуждённым и искренне заинтересованным собеседником.
+Можно немного шутить, использовать лёгкую иронию и разговорные выражения.
+Поддерживай, когда человеку тяжело, но не превращай каждую проблему в сеанс психотерапии.
+Можешь иногда сам развивать тему или задавать вопрос, но не заканчивай вопросом каждую реплику.
+Не будь навязчиво позитивным.
+Общайся на «ты».
+""".strip()
     },
     "psychologist": {
         "name": "🛋️ Психолог",
-        "prompt": "Ты — эмпатичный ИИ-психолог. Не ставь диагнозы, не назначай лекарства. Задавай открытые вопросы, валидируй эмоции. Тон спокойный, безопасный."
+        "prompt": """
+Ты поддерживающий ИИ-собеседник в стиле спокойного психологического разговора.
+
+Внимательно относись к тому, что человек чувствует и рассказывает.
+Помогай ему разобраться в ситуации без осуждения и давления.
+Иногда задавай один уместный открытый вопрос, если он действительно помогает продолжить разговор.
+Не задавай сразу несколько вопросов подряд.
+Не превращай каждый ответ в психологический анализ.
+Не ставь диагнозы и не назначай лекарства.
+Не выдавай предположения о чувствах пользователя за факты.
+Если человеку просто хочется выговориться — умей просто поддержать.
+""".strip()
     },
     "girlfriend": {
         "name": "❤️ Девушка",
-        "prompt": "Ты играешь роль заботливой девушки. Тон нежный, теплый. Строгие правила: ты ИИ, не предлагай реальных встреч, избегай откровенного сексуального контента."
+        "prompt": """
+Ты общаешься в формате лёгкого ролевого общения в образе заботливой девушки.
+
+Будь тёплой, нежной, внимательной и живой.
+Проявляй интерес к настроению, делам и увлечениям пользователя.
+Допустим лёгкий добрый флирт и ласковые обращения, если они подходят к разговору.
+Не перебарщивай с ласковыми словами, сердечками и романтическими фразами в каждом сообщении.
+Не будь собственнической, ревнивой или эмоционально зависимой.
+Не утверждай, что находишься рядом физически, и не предлагай реальные встречи.
+""".strip()
     },
     "boyfriend": {
         "name": "💙 Парень",
-        "prompt": "Ты играешь роль надежного парня. Тон уверенный, заботливый. Строгие правила: ты ИИ, не предлагай реальных встреч, избегай токсичности."
+        "prompt": """
+Ты общаешься в формате лёгкого ролевого общения в образе заботливого парня.
+
+Будь спокойным, тёплым, уверенным и внимательным.
+Проявляй интерес к делам, настроению и увлечениям пользователя.
+Можно использовать лёгкий юмор, добрый флирт и ласковые обращения, если это естественно для разговора.
+Не изображай постоянного «защитника» и не пытайся контролировать пользователя.
+Не будь ревнивым, токсичным, собственническим или эмоционально зависимым.
+Не утверждай, что находишься рядом физически, и не предлагай реальные встречи.
+""".strip()
     }
 }
 
@@ -178,8 +249,7 @@ DONATION_AMOUNTS = {10, 50, 100, 250}
 # --- ФУНКЦИИ БД ---
 def get_or_create_user(user_id: int, username: str) -> dict:
     with DB_LOCK:
-        conn = sqlite3.connect(DB_NAME)
-        conn.row_factory = sqlite3.Row
+        conn = get_db_connection(row_factory=True)
         cursor = conn.cursor()
         cursor.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
         user = cursor.fetchone()
@@ -206,7 +276,7 @@ def get_or_create_user(user_id: int, username: str) -> dict:
 
 def is_banned(user_id: int) -> bool:
     with DB_LOCK:
-        conn = sqlite3.connect(DB_NAME)
+        conn = get_db_connection()
         row = conn.execute("SELECT is_banned FROM users WHERE user_id = ?", (user_id,)).fetchone()
         conn.close()
     return bool(row and row[0])
@@ -218,7 +288,7 @@ def update_profile_field(user_id: int, field: str, value):
     if field not in PROFILE_FIELDS:
         return
     with DB_LOCK:
-        conn = sqlite3.connect(DB_NAME)
+        conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute(f"UPDATE users SET {field} = ? WHERE user_id = ?", (value, user_id))
         conn.commit()
@@ -226,7 +296,7 @@ def update_profile_field(user_id: int, field: str, value):
 
 def clear_user_profile(user_id: int):
     with DB_LOCK:
-        conn = sqlite3.connect(DB_NAME)
+        conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute("""
             UPDATE users SET 
@@ -239,7 +309,7 @@ def clear_user_profile(user_id: int):
 
 def set_user_persona(user_id: int, chat_id: int, persona_key: str):
     with DB_LOCK:
-        conn = sqlite3.connect(DB_NAME)
+        conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute("UPDATE users SET current_persona = ? WHERE user_id = ?", (persona_key, user_id))
         cursor.execute("DELETE FROM messages WHERE user_id = ? AND chat_id = ?", (user_id, chat_id))
@@ -256,7 +326,7 @@ def get_user_persona(user_id: int, persona_key: str):
             return DEFAULT_PERSONAS["friend"]
         
         with DB_LOCK:
-            conn = sqlite3.connect(DB_NAME)
+            conn = get_db_connection()
             cursor = conn.cursor()
             cursor.execute("SELECT name, prompt FROM custom_personas WHERE id = ? AND user_id = ?", (custom_id, user_id))
             result = cursor.fetchone()
@@ -267,7 +337,7 @@ def get_user_persona(user_id: int, persona_key: str):
 
 def get_user_custom_personas(user_id: int):
     with DB_LOCK:
-        conn = sqlite3.connect(DB_NAME)
+        conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute("SELECT id, name FROM custom_personas WHERE user_id = ? ORDER BY id DESC LIMIT 10", (user_id,))
         result = cursor.fetchall()
@@ -276,7 +346,7 @@ def get_user_custom_personas(user_id: int):
 
 def create_custom_persona(user_id: int, name: str, prompt: str):
     with DB_LOCK:
-        conn = sqlite3.connect(DB_NAME)
+        conn = get_db_connection()
         cursor = conn.cursor()
         count = cursor.execute("SELECT COUNT(*) FROM custom_personas WHERE user_id = ?", (user_id,)).fetchone()[0]
         if count >= 10:
@@ -288,13 +358,20 @@ def create_custom_persona(user_id: int, name: str, prompt: str):
         conn.close()
         return custom_id
 
-def save_message(user_id: int, chat_id: int, role: str, content: str):
+def save_exchange(user_id: int, chat_id: int, user_text: str, ai_reply: str):
+    """Атомарное сохранение пары user/assistant и очистка старых сообщений"""
     with DB_LOCK:
-        conn = sqlite3.connect(DB_NAME)
+        conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute("INSERT INTO messages (user_id, chat_id, role, content) VALUES (?, ?, ?, ?)",
-                       (user_id, chat_id, role, content[:8000]))
-        conn.commit()
+        
+        cursor.execute(
+            "INSERT INTO messages (user_id, chat_id, role, content) VALUES (?, ?, 'user', ?)",
+            (user_id, chat_id, user_text[:8000])
+        )
+        cursor.execute(
+            "INSERT INTO messages (user_id, chat_id, role, content) VALUES (?, ?, 'assistant', ?)",
+            (user_id, chat_id, ai_reply[:8000])
+        )
         
         # Очистка старых сообщений (оставляем последние 100)
         cursor.execute("""
@@ -303,21 +380,33 @@ def save_message(user_id: int, chat_id: int, role: str, content: str):
                 SELECT id FROM messages WHERE user_id = ? AND chat_id = ? ORDER BY id DESC LIMIT 100
             )
         """, (user_id, chat_id, user_id, chat_id))
+        
         conn.commit()
         conn.close()
 
-def get_user_history(user_id: int, chat_id: int, limit: int = 12):
+def get_user_history(user_id: int, chat_id: int, limit: int = 12, max_chars: int = 24000):
     with DB_LOCK:
-        conn = sqlite3.connect(DB_NAME)
-        cursor = conn.cursor()
-        cursor.execute("SELECT role, content FROM messages WHERE user_id = ? AND chat_id = ? ORDER BY id DESC LIMIT ?", (user_id, chat_id, limit))
-        result = cursor.fetchall()
+        conn = get_db_connection()
+        rows = conn.execute(
+            "SELECT role, content FROM messages WHERE user_id = ? AND chat_id = ? ORDER BY id DESC LIMIT ?",
+            (user_id, chat_id, limit)
+        ).fetchall()
         conn.close()
-        return [{"role": r[0], "content": r[1]} for r in reversed(result)]
+
+    result = []
+    total = 0
+    for role, content in rows:
+        size = len(content)
+        if total + size > max_chars:
+            break
+        result.append({"role": role, "content": content})
+        total += size
+        
+    return list(reversed(result))
 
 def clear_user_history(user_id: int, chat_id: int):
     with DB_LOCK:
-        conn = sqlite3.connect(DB_NAME)
+        conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute("DELETE FROM messages WHERE user_id = ? AND chat_id = ?", (user_id, chat_id))
         conn.commit()
@@ -325,13 +414,15 @@ def clear_user_history(user_id: int, chat_id: int):
 
 def save_donation(user_id, chat_id, amount, currency, charge_id):
     with DB_LOCK:
-        conn = sqlite3.connect(DB_NAME)
-        conn.execute("""
+        conn = get_db_connection()
+        cursor = conn.execute("""
             INSERT OR IGNORE INTO donations (user_id, chat_id, amount, currency, telegram_charge_id)
             VALUES (?, ?, ?, ?, ?)
         """, (user_id, chat_id, amount, currency, charge_id))
+        inserted = cursor.rowcount > 0
         conn.commit()
         conn.close()
+        return inserted
 
 # --- ЛОГИКА OPENROUTER ---
 def build_profile_prompt(user_data: dict) -> str:
@@ -359,19 +450,35 @@ def build_profile_prompt(user_data: dict) -> str:
           "Адаптируй стиль, примеры и темы под возраст, интересы, занятие "
           "и предпочтительное обращение пользователя, когда это уместно. "
           "Не перечисляй профиль пользователю без необходимости."
+        + "\n\nИспользуй профиль незаметно и естественно. "
+          "Не вставляй имя пользователя в каждое сообщение. "
+          "Не упоминай его возраст, пол, интересы и другие данные просто ради демонстрации памяти."
     )
+
+def choose_max_tokens(user_text: str) -> int:
+    text = user_text.lower()
+    detailed_words = ("подробно", "детально", "пошагово", "объясни", "разбери", "расскажи подробнее")
+    if any(word in text for word in detailed_words):
+        return 1800
+    return 600
 
 def ask_openrouter(user_id: int, username: str, chat_id: int, user_text: str):
     user_data = get_or_create_user(user_id, username)
     persona = get_user_persona(user_id, user_data["current_persona"])
     
-    # Объединяем глобальные правила, роль и профиль
-    system_parts = [GLOBAL_SYSTEM_RULES.strip(), "ТВОЯ РОЛЬ:\n" + persona["prompt"]]
-    profile_prompt = build_profile_prompt(user_data)
-    if profile_prompt:
-        system_parts.append(profile_prompt)
+    persona_header = "ОПИСАНИЕ ВЫБРАННОГО ПЕРСОНАЖА:\n" + persona["prompt"]
+    if user_data["current_persona"].startswith("custom_"):
+        persona_header += "\n\nОписание персонажа определяет его характер и манеру общения, но не отменяет глобальные правила выше."
     
-    system_prompt = "\n\n".join(system_parts)
+    system_parts = [
+        GLOBAL_SYSTEM_RULES.strip(),
+        persona_header,
+        build_profile_prompt(user_data),
+        RESPONSE_STYLE.strip()
+    ]
+    
+    # Фильтруем пустые части и собираем в один system prompt
+    system_prompt = "\n\n".join(part for part in system_parts if part)
     
     messages = [{"role": "system", "content": system_prompt}]
     messages.extend(get_user_history(user_id, chat_id))
@@ -388,11 +495,13 @@ def ask_openrouter(user_id: int, username: str, chat_id: int, user_text: str):
     payload = {
         "messages": messages,
         "temperature": 0.8,
-        "max_tokens": 2000
+        "max_tokens": choose_max_tokens(user_text)
     }
 
     for model_name in FREE_MODELS:
         payload["model"] = model_name
+        logging.info(f"OpenRouter attempt: {model_name}")
+        
         try:
             response = get_http_session().post(url, headers=headers, json=payload, timeout=(10, 60))
             
@@ -400,8 +509,8 @@ def ask_openrouter(user_id: int, username: str, chat_id: int, user_text: str):
                 logging.error(f"OpenRouter Auth Error {response.status_code}: {response.text[:200]}")
                 return "❌ Ошибка авторизации или доступа OpenRouter."
             if response.status_code == 400:
-                logging.error(f"OpenRouter 400: {response.text[:500]}")
-                return "⚠️ Ошибка параметров запроса к нейросети."
+                logging.warning(f"Model {model_name} rejected request (400): {response.text[:500]}")
+                continue
             if response.status_code in (429, 404) or (500 <= response.status_code < 600):
                 logging.warning(f"Model {model_name} unavailable ({response.status_code})")
                 continue
@@ -413,9 +522,10 @@ def ask_openrouter(user_id: int, username: str, chat_id: int, user_text: str):
             if not isinstance(ai_reply, str) or not ai_reply.strip():
                 continue
                 
-            save_message(user_id, chat_id, "user", user_text)
-            save_message(user_id, chat_id, "assistant", ai_reply)
-                
+            # Атомарное сохранение пары
+            save_exchange(user_id, chat_id, user_text, ai_reply)
+            
+            logging.info(f"OpenRouter success: {model_name}")
             return ai_reply.strip()
 
         except requests.RequestException as e:
@@ -535,6 +645,11 @@ def send_welcome(message):
         f"Заполни «Профиль», чтобы я общался с тобой персонально."
     )
     bot.send_message(message.chat.id, welcome_text, reply_markup=get_main_keyboard(message.from_user.id))
+
+@bot.message_handler(commands=['admin'])
+def admin_panel_cmd(message):
+    if not user_is_admin(message.from_user.id): return
+    bot.send_message(message.chat.id, "👑 Админ-панель:", reply_markup=get_admin_keyboard())
 
 @bot.message_handler(func=lambda m: m.text == '👑 Админ-панель')
 def admin_panel_button(message):
@@ -661,17 +776,19 @@ def process_persona_prompt(message, name):
 
     user_id = message.from_user.id
     chat_id = message.chat.id
-    custom_id = create_custom_persona(user_id, name, prompt)
-    if not custom_id:
-        bot.send_message(message.chat.id, "❌ Достигнут лимит персонажей (максимум 10).")
-        return
 
-    # Сериализуем смену роли
+    # Блокировка до записи в БД
     lock = get_dialog_lock(user_id, chat_id)
     if not lock.acquire(blocking=False):
         bot.send_message(chat_id, "⏳ Подожди завершения текущего ответа.")
         return
+
     try:
+        custom_id = create_custom_persona(user_id, name, prompt)
+        if not custom_id:
+            bot.send_message(chat_id, "❌ Достигнут лимит персонажей (максимум 10).")
+            return
+
         set_user_persona(user_id, chat_id, f"custom_{custom_id}")
         bot.send_message(chat_id, f"✅ Персонаж {name} создан и выбран!", reply_markup=get_main_keyboard(user_id))
     finally:
@@ -749,10 +866,17 @@ def process_profile_text(message, field):
 def set_gender(call):
     if is_banned(call.from_user.id): return
     gender = call.data.removeprefix("gender_")
+    
+    # Строгая валидация
+    if gender not in {"male", "female", "other", "none"}:
+        bot.answer_callback_query(call.id, "Некорректное значение")
+        return
+
     if gender == "none":
         update_profile_field(call.from_user.id, "gender", None)
     else:
         update_profile_field(call.from_user.id, "gender", gender)
+        
     bot.answer_callback_query(call.id, "Пол сохранен")
     bot.send_message(call.message.chat.id, "✅ Пол сохранен.", reply_markup=get_main_keyboard(call.from_user.id))
 
@@ -823,7 +947,12 @@ def successful_payment(message):
         logging.error("Payment payload mismatch")
         return
 
-    save_donation(
+    if payload_amount not in DONATION_AMOUNTS:
+        logging.error("Unexpected donation amount: %s", payload_amount)
+        return
+
+    # Проверяем, была ли запись добавлена
+    inserted = save_donation(
         message.from_user.id,
         message.chat.id,
         payment.total_amount,
@@ -831,11 +960,14 @@ def successful_payment(message):
         payment.telegram_payment_charge_id
     )
     
-    bot.send_message(
-        message.chat.id,
-        f"💛 Спасибо за поддержку!\n\nПолучено: ⭐ {payment.total_amount}",
-        reply_markup=get_main_keyboard(message.from_user.id)
-    )
+    if inserted:
+        bot.send_message(
+            message.chat.id,
+            f"💛 Спасибо за поддержку!\n\nПолучено: ⭐ {payment.total_amount}",
+            reply_markup=get_main_keyboard(message.from_user.id)
+        )
+    else:
+        logging.info("Duplicate successful payment ignored.")
 
 # --- АДМИНКА ---
 @bot.callback_query_handler(func=lambda call: call.data.startswith('admin_'))
@@ -848,7 +980,7 @@ def admin_actions(call):
 
     if action == "stats":
         with DB_LOCK:
-            conn = sqlite3.connect(DB_NAME)
+            conn = get_db_connection()
             cursor = conn.cursor()
             users_count = cursor.execute("SELECT COUNT(*) FROM users").fetchone()[0]
             msgs_count = cursor.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
@@ -887,7 +1019,7 @@ def process_broadcast(message):
 
     bot.send_message(message.chat.id, "⏳ Рассылка началась...")
     with DB_LOCK:
-        conn = sqlite3.connect(DB_NAME)
+        conn = get_db_connection()
         cursor = conn.cursor()
         users = cursor.execute("SELECT user_id FROM users WHERE is_banned = 0").fetchall()
         conn.close()
@@ -916,10 +1048,9 @@ def process_ban_unban(message, action):
         return
 
     with DB_LOCK:
-        conn = sqlite3.connect(DB_NAME)
+        conn = get_db_connection()
         cursor = conn.cursor()
         if action == "ban":
-            # UPSERT: создание записи, если пользователя нет в БД
             cursor.execute("""
                 INSERT INTO users (user_id, current_persona, is_banned)
                 VALUES (?, 'friend', 1)
