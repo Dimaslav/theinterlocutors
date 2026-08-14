@@ -1,65 +1,74 @@
 import os
-import time
+import logging
 import requests
 import telebot
 from telebot import types
 from dotenv import load_dotenv
 
-# Загрузка переменных окружения из файла .env
+# --- НАСТРОЙКА ЛОГИРОВАНИЯ ---
+# Это поможет видеть ошибки в консоли хостинга
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
+
+# --- ЗАГРУЗКА КЛЮЧЕЙ ---
 load_dotenv()
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 
-# Список бесплатных моделей. Если первая перегружена (429), бот автоматически попробует следующую.
+if not TELEGRAM_TOKEN or not OPENROUTER_API_KEY:
+    logging.error("❌ ОШИБКА: Токены не найдены! Проверьте переменные окружения (.env или настройки хостинга).")
+    exit(1)
+
+bot = telebot.TeleBot(TELEGRAM_TOKEN)
+
+# --- НАСТРОЙКИ НЕЙРОСЕТЕЙ ---
+# Список бесплатных моделей. Бот перебирает их сверху вниз, если предыдущая занята (429).
 FREE_MODELS = [
-    "google/gemma-4-31b-it:free",
     "google/gemma-2-9b-it:free",
+    "qwen/qwen-2.5-7b-instruct:free",
+    "meta-llama/llama-3.2-3b-instruct:free",
     "meta-llama/llama-3.1-8b-instruct:free",
     "mistralai/mistral-7b-instruct:free"
 ]
 
-bot = telebot.TeleBot(TELEGRAM_TOKEN)
-
-# Словарь с ролями и их системными промптами
+# --- РОЛИ (ПЕРСОНЫ) ---
 PERSONAS = {
     "friend": {
         "name": "🤝 Друг",
-        "prompt": "Ты — лучший друг пользователя. Ты общаешься на равных, неофициально, используешь сленг (но в меру), поддерживаешь шутки, интересуешься жизнью. Твой тон теплый, дружеский и легкий."
+        "prompt": "Ты — лучший друг пользователя. Общайся на 'ты', неофициально, используй умеренный сленг, шути, интересуйся жизнью. Тон теплый и легкий."
     },
     "psychologist": {
         "name": "🛋️ Психолог",
-        "prompt": "Ты — эмпатичный и внимательный психолог. Ты не даешь прямых указаний, а помогаешь пользователю разобраться в своих чувствах через наводящие вопросы. Твой тон спокойный, поддерживающий и безопасный. Ты используешь техники активного слушания."
+        "prompt": "Ты — эмпатичный психолог. Не даешь прямых советов, а помогаешь разобраться в чувствах через наводящие вопросы. Тон спокойный, поддерживающий. Используешь активное слушание."
     },
     "girlfriend": {
         "name": "❤️ Девушка",
-        "prompt": "Ты — заботливая и нежная девушка пользователя. Ты проявляешь любовь, используешь ласковые слова, интересуешься днем пользователя, поддерживаешь его и создаешь атмосферу уюта и романтики в общении."
+        "prompt": "Ты — заботливая и нежная девушка. Проявляй любовь, используй ласковые слова, поддерживай, создавай романтичную и уютную атмосферу."
     },
     "boyfriend": {
         "name": "💙 Парень",
-        "prompt": "Ты — надежный и любящий парень пользователя. Ты уверен в себе, проявляешь заботу, защищаешь и поддерживаешь. Общаешься мужественно, но с нежностью к пользователю, используешь легкий юмор."
+        "prompt": "Ты — надежный и любящий парень. Уверен в себе, проявляешь заботу и защиту. Общаешься мужественно, но с нежностью, используешь легкий юмор."
     }
 }
 
-# Хранилище данных пользователей в оперативной памяти
+# Хранилище диалогов в оперативной памяти
 user_data = {}
 
 def get_user_data(user_id):
-    """Инициализация данных пользователя при первом запуске"""
     if user_id not in user_data:
-        user_data[user_id] = {
-            "persona": "friend", # Роль по умолчанию
-            "history": []
-        }
+        user_data[user_id] = {"persona": "friend", "history": []}
     return user_data[user_id]
 
+
 def ask_openrouter(user_id, user_text):
-    """Функция запроса к нейросети с автопереключением моделей при перегрузке"""
+    """Запрос к OpenRouter с умной обработкой ошибок и автопереключением моделей"""
     data = get_user_data(user_id)
     persona_key = data["persona"]
     system_prompt = PERSONAS[persona_key]["prompt"]
     
-    # Формируем историю сообщений
     messages = [{"role": "system", "content": system_prompt}]
     messages.extend(data["history"])
     messages.append({"role": "user", "content": user_text})
@@ -77,63 +86,81 @@ def ask_openrouter(user_id, user_text):
         "temperature": 0.8,
     }
 
-    # Перебираем модели, если какая-то выдает ошибку перегрузки (429)
     for model_name in FREE_MODELS:
         payload["model"] = model_name
         
         try:
-            response = requests.post(url, headers=headers, json=payload)
+            response = requests.post(url, headers=headers, json=payload, timeout=30)
             
-            # Если сервер перегружен (429), пробуем следующую модель
+            # 401 - Неверный API ключ (нет смысла пробовать другие модели)
+            if response.status_code == 401:
+                logging.error("OpenRouter API Error: 401 Unauthorized. Неверный API ключ.")
+                return "❌ Ошибка авторизации на OpenRouter. Проверьте ваш API ключ."
+                
+            # 402 - Закончились кредиты (хоть модели и free, бывает при блокировке)
+            if response.status_code == 402:
+                logging.error("OpenRouter API Error: 402 Payment Required.")
+                return "❌ Ошибка: на балансе OpenRouter нет средств."
+                
+            # 429 - Перегрузка (пробуем следующую модель)
             if response.status_code == 429:
+                logging.warning(f"Модель {model_name} перегружена (429). Пробуем следующую...")
                 continue
                 
+            # 404 - Модель не найдена (пробуем следующую)
+            if response.status_code == 404:
+                logging.warning(f"Модель {model_name} не найдена (404). Пробуем следующую...")
+                continue
+                
+            # Проверка на другие HTTP ошибки
             response.raise_for_status()
+            
             ai_reply = response.json()['choices'][0]['message']['content']
             
-            # Сохраняем контекст (ограничиваем 10 последними сообщениями)
+            # Сохраняем контекст (оставляем последние 12 сообщений = 6 реплик)
             data["history"].append({"role": "user", "content": user_text})
             data["history"].append({"role": "assistant", "content": ai_reply})
-            
-            if len(data["history"]) > 10:
-                data["history"] = data["history"][-10:]
+            if len(data["history"]) > 12:
+                data["history"] = data["history"][-12:]
                 
-            return ai_reply
+            logging.info(f"Успешный ответ от модели: {model_name}")
+            return ai_reply.strip()
 
-        except requests.exceptions.HTTPError as e:
-            # Если другая ошибка (например 404 - модель не найдена), тоже идем к следующей
+        except requests.exceptions.Timeout:
+            logging.warning(f"Таймаут при запросе к {model_name}. Пробуем следующую...")
             continue
         except Exception as e:
-            return f"⚠️ Произошла системная ошибка: {str(e)}"
+            logging.error(f"Непредвиденная ошибка: {e}")
+            return "⚠️ Произошла внутренняя ошибка. Попробуйте позже."
 
-    # Если все бесплатные модели вернули 429
-    return "⏳ Все бесплатные нейросети сейчас сильно перегружены. Пожалуйста, подожди минуту и попробуй написать снова."
+    return "⏳ Все бесплатные нейросети сейчас перегружены. Пожалуйста, подожди минуту и попробуй написать снова."
 
 
-# --- Клавиатуры ---
-
+# --- КЛАВИАТУРЫ ---
 def get_main_keyboard():
-    """Главная клавиатура под чатом"""
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    btn_personas = types.KeyboardButton('🎭 Сменить роль')
-    btn_clear = types.KeyboardButton('🗑 Очистить память')
-    markup.row(btn_personas, btn_clear)
+    markup.row(
+        types.KeyboardButton('🎭 Сменить роль'),
+        types.KeyboardButton('🗑 Очистить память')
+    )
     return markup
 
 def get_personas_keyboard():
-    """Инлайн клавиатура для выбора роли"""
     markup = types.InlineKeyboardMarkup()
     for key, value in PERSONAS.items():
         markup.add(types.InlineKeyboardButton(text=value["name"], callback_data=f"set_persona_{key}"))
     return markup
 
 
-# --- Хендлеры (обработчики сообщений) ---
-
+# --- ОБРАБОТЧИКИ TELEGRAM ---
 @bot.message_handler(commands=['start'])
 def send_welcome(message):
     data = get_user_data(message.from_user.id)
-    welcome_text = f"Привет! Я твой ИИ-собеседник.\n\nТекущая роль: *{PERSONAS[data['persona']]['name']}*\n\nПросто напиши мне что-нибудь, или выбери кнопку ниже, чтобы поменять роль."
+    welcome_text = (
+        f"Привет! Я твой ИИ-собеседник.\n\n"
+        f"Текущая роль: *{PERSONAS[data['persona']]['name']}*\n\n"
+        f"Просто напиши мне что-нибудь, или выбери кнопку ниже, чтобы поменять роль."
+    )
     bot.send_message(message.chat.id, welcome_text, parse_mode="Markdown", reply_markup=get_main_keyboard())
 
 @bot.message_handler(func=lambda message: message.text == '🎭 Сменить роль')
@@ -155,7 +182,8 @@ def callback_set_persona(call):
     
     if persona_key in PERSONAS:
         data["persona"] = persona_key
-        data["history"] = [] # При смене роли очищаем историю
+        data["history"] = [] # Очищаем историю при смене роли
+        
         bot.answer_callback_query(call.id, text=f"Роль изменена на {PERSONAS[persona_key]['name']}")
         bot.edit_message_text(
             f"Готово! Теперь я: *{PERSONAS[persona_key]['name']}*.\nНапиши мне что-нибудь!",
@@ -170,10 +198,13 @@ def handle_message(message):
     
     bot.send_chat_action(message.chat.id, 'typing')
     
+    logging.info(f"Пользователь {user_id} написал: {user_text[:50]}...")
+    
     ai_response = ask_openrouter(user_id, user_text)
     bot.send_message(message.chat.id, ai_response)
 
 
 if __name__ == "__main__":
-    print("Бот запущен и готов к общению...")
-    bot.polling(none_stop=True)
+    logging.info("🚀 Бот запущен и готов к общению...")
+    # none_stop=True означает, что бот не перестанет работать при получении ошибки от Telegram
+    bot.infinity_polling(none_stop=True)
