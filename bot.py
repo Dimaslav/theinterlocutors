@@ -93,11 +93,7 @@ def get_dialog_lock(user_id: int, chat_id: int):
 
 # --- НАСТРОЙКИ МОДЕЛЕЙ OPENROUTER ---
 FREE_MODELS = [
-    "nvidia/nemotron-3.5-lightning:free",
-    "nvidia/nemotron-3-ultra-550b-a55b:free",
-    "google/gemma-4-26b-a4b-it:free",
     "google/gemma-4-31b-it:free",
-    "openrouter/free"
 ]
 
 # --- ПРОМПТЫ И ФИЛЬТРАЦИЯ ---
