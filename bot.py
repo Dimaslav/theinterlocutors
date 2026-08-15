@@ -94,8 +94,6 @@ def get_dialog_lock(user_id: int, chat_id: int):
 # --- НАСТРОЙКИ МОДЕЛЕЙ OPENROUTER ---
 FREE_MODELS = [
     "google/gemma-4-31b-it:free",
-    "google/gemma-4-26b-a4b-it:free",
-    "poolside/laguna-xs-2.1:free",
     "nvidia/nemotron-3.5-lightning:free",
 ]
 
